@@ -559,131 +559,10 @@ public abstract class Index extends SchemaObject {
     protected final long getCostRangeIndex(int[] masks, long rowCount, TableFilter[] filters, int filter,
             SortOrder sortOrder, boolean isScanIndex, AllColumnsForPlan allColumnsSet) {
         rowCount += Constants.COST_ROW_OFFSET;
-        int totalSelectivity = 0;
-        long rowsCost = rowCount;
-        if (masks != null) {
-            int i = 0, len = columns.length;
-            boolean tryAdditional = false;
-            while (i < len) {
-                Column column = columns[i++];
-                int index = column.getColumnId();
-                int mask = masks[index];
-                if ((mask & IndexCondition.EQUALITY) == IndexCondition.EQUALITY) {
-                    if (i > 0 && i == uniqueColumnColumn) {
-                        rowsCost = 3;
-                        break;
-                    }
-                    totalSelectivity = 100 - ((100 - totalSelectivity) *
-                            (100 - column.getSelectivity()) / 100);
-                    long distinctRows = rowCount * totalSelectivity / 100;
-                    if (distinctRows <= 0) {
-                        distinctRows = 1;
-                    }
-                    rowsCost = 2 + Math.max(rowCount / distinctRows, 1);
-                } else if ((mask & IndexCondition.RANGE) == IndexCondition.RANGE) {
-                    rowsCost = 2 + rowsCost / 4;
-                    tryAdditional = true;
-                    break;
-                } else if ((mask & IndexCondition.START) == IndexCondition.START) {
-                    rowsCost = 2 + rowsCost / 3;
-                    tryAdditional = true;
-                    break;
-                } else if ((mask & IndexCondition.END) == IndexCondition.END) {
-                    rowsCost = rowsCost / 3;
-                    tryAdditional = true;
-                    break;
-                } else if ((mask & IndexCondition.SPATIAL_INTERSECTS) == IndexCondition.SPATIAL_INTERSECTS) {
-                    rowsCost = 2 + rowsCost / 4;
-                    tryAdditional = true;
-                    break;
-                } else {
-                    if (mask == 0) {
-                        // Adjust counter of used columns (i)
-                        i--;
-                    }
-                    break;
-                }
-            }
-            // Some additional columns can still be used
-            if (tryAdditional) {
-                while (i < len && masks[columns[i].getColumnId()] != 0) {
-                    i++;
-                    rowsCost--;
-                }
-            }
-            // Increase cost of indexes with additional unused columns
-            rowsCost += len - i;
-        }
-        // If the ORDER BY clause matches the ordering of this index,
-        // it will be cheaper than another index, so adjust the cost
-        // accordingly.
-        long sortingCost = 0;
-        if (sortOrder != null) {
-            sortingCost = 100 + rowCount / 10;
-        }
-        if (sortOrder != null && !isScanIndex) {
-            boolean sortOrderMatches = true;
-            int coveringCount = 0;
-            int[] sortTypes = sortOrder.getSortTypesWithNullOrdering();
-            TableFilter tableFilter = filters == null ? null : filters[filter];
-            for (int i = 0, len = sortTypes.length; i < len; i++) {
-                if (i >= indexColumns.length) {
-                    // We can still use this index if we are sorting by more
-                    // than it's columns, it's just that the coveringCount
-                    // is lower than with an index that contains
-                    // more of the order by columns.
-                    break;
-                }
-                Column col = sortOrder.getColumn(i, tableFilter);
-                if (col == null) {
-                    sortOrderMatches = false;
-                    break;
-                }
-                IndexColumn indexCol = indexColumns[i];
-                if (!col.equals(indexCol.column)) {
-                    sortOrderMatches = false;
-                    break;
-                }
-                int sortType = sortTypes[i];
-                if (sortType != indexCol.sortType) {
-                    sortOrderMatches = false;
-                    break;
-                }
-                coveringCount++;
-            }
-            if (sortOrderMatches) {
-                // "coveringCount" makes sure that when we have two
-                // or more covering indexes, we choose the one
-                // that covers more.
-                sortingCost = 100 - coveringCount;
-            }
-        }
-        // If we have two indexes with the same cost, and one of the indexes can
-        // satisfy the query without needing to read from the primary table
-        // (scan index), make that one slightly lower cost.
-        boolean needsToReadFromScanIndex;
-        if (!isScanIndex && allColumnsSet != null) {
-            needsToReadFromScanIndex = false;
-            ArrayList<Column> foundCols = allColumnsSet.get(getTable());
-            if (foundCols != null) {
-                int main = table.getMainIndexColumn();
-                loop: for (Column c : foundCols) {
-                    int id = c.getColumnId();
-                    if (id == SearchRow.ROWID_INDEX || id == main) {
-                        continue;
-                    }
-                    for (Column c2 : columns) {
-                        if (c == c2) {
-                            continue loop;
-                        }
-                    }
-                    needsToReadFromScanIndex = true;
-                    break;
-                }
-            }
-        } else {
-            needsToReadFromScanIndex = true;
-        }
+        long rowsCost = calculateRowsCostFromMasks(masks, rowCount);
+        long sortingCost = calculateSortingCost(sortOrder, rowCount, filters, filter, isScanIndex);
+        boolean needsToReadFromScanIndex = needsToReadFromScanIndex(isScanIndex, allColumnsSet);
+        
         long rc;
         if (isScanIndex) {
             rc = rowsCost + sortingCost + 20;
@@ -698,6 +577,191 @@ public abstract class Index extends SchemaObject {
             rc = rowsCost + sortingCost + columns.length;
         }
         return rc;
+    }
+
+    /**
+     * Calculate the cost based on index condition masks.
+     *
+     * @param masks the index condition masks
+     * @param rowCount the row count
+     * @return the calculated rows cost
+     */
+    private long calculateRowsCostFromMasks(int[] masks, long rowCount) {
+        long rowsCost = rowCount;
+        if (masks == null) {
+            return rowsCost;
+        }
+        
+        int totalSelectivity = 0;
+        int i = 0, len = columns.length;
+        boolean tryAdditional = false;
+        
+        while (i < len) {
+            Column column = columns[i++];
+            int index = column.getColumnId();
+            int mask = masks[index];
+            
+            if ((mask & IndexCondition.EQUALITY) == IndexCondition.EQUALITY) {
+                if (i > 0 && i == uniqueColumnColumn) {
+                    rowsCost = 3;
+                    break;
+                }
+                totalSelectivity = 100 - ((100 - totalSelectivity) *
+                        (100 - column.getSelectivity()) / 100);
+                long distinctRows = rowCount * totalSelectivity / 100;
+                if (distinctRows <= 0) {
+                    distinctRows = 1;
+                }
+                rowsCost = 2 + Math.max(rowCount / distinctRows, 1);
+            } else if ((mask & IndexCondition.RANGE) == IndexCondition.RANGE) {
+                rowsCost = 2 + rowsCost / 4;
+                tryAdditional = true;
+                break;
+            } else if ((mask & IndexCondition.START) == IndexCondition.START) {
+                rowsCost = 2 + rowsCost / 3;
+                tryAdditional = true;
+                break;
+            } else if ((mask & IndexCondition.END) == IndexCondition.END) {
+                rowsCost = rowsCost / 3;
+                tryAdditional = true;
+                break;
+            } else if ((mask & IndexCondition.SPATIAL_INTERSECTS) == IndexCondition.SPATIAL_INTERSECTS) {
+                rowsCost = 2 + rowsCost / 4;
+                tryAdditional = true;
+                break;
+            } else {
+                if (mask == 0) {
+                    // Adjust counter of used columns (i)
+                    i--;
+                }
+                break;
+            }
+        }
+        
+        // Some additional columns can still be used
+        if (tryAdditional) {
+            while (i < len && masks[columns[i].getColumnId()] != 0) {
+                i++;
+                rowsCost--;
+            }
+        }
+        // Increase cost of indexes with additional unused columns
+        rowsCost += len - i;
+        
+        return rowsCost;
+    }
+
+    /**
+     * Calculate the sorting cost based on whether the sort order matches the index.
+     *
+     * @param sortOrder the sort order
+     * @param rowCount the row count
+     * @param filters the table filters
+     * @param filter the current filter index
+     * @param isScanIndex whether this is a scan index
+     * @return the calculated sorting cost
+     */
+    private long calculateSortingCost(SortOrder sortOrder, long rowCount, TableFilter[] filters, 
+            int filter, boolean isScanIndex) {
+        if (sortOrder == null) {
+            return 0;
+        }
+        
+        long sortingCost = 100 + rowCount / 10;
+        
+        if (isScanIndex) {
+            return sortingCost;
+        }
+        
+        int coveringCount = calculateSortOrderCoveringCount(sortOrder, filters, filter);
+        if (coveringCount > 0) {
+            // "coveringCount" makes sure that when we have two
+            // or more covering indexes, we choose the one
+            // that covers more.
+            sortingCost = 100 - coveringCount;
+        }
+        
+        return sortingCost;
+    }
+
+    /**
+     * Calculate how many columns of the sort order are covered by this index.
+     *
+     * @param sortOrder the sort order
+     * @param filters the table filters
+     * @param filter the current filter index
+     * @return the number of covered columns, or 0 if sort order doesn't match
+     */
+    private int calculateSortOrderCoveringCount(SortOrder sortOrder, TableFilter[] filters, int filter) {
+        int coveringCount = 0;
+        int[] sortTypes = sortOrder.getSortTypesWithNullOrdering();
+        TableFilter tableFilter = filters == null ? null : filters[filter];
+        
+        for (int i = 0, len = sortTypes.length; i < len; i++) {
+            if (i >= indexColumns.length) {
+                // We can still use this index if we are sorting by more
+                // than it's columns, it's just that the coveringCount
+                // is lower than with an index that contains
+                // more of the order by columns.
+                break;
+            }
+            
+            Column col = sortOrder.getColumn(i, tableFilter);
+            if (col == null) {
+                break;
+            }
+            
+            IndexColumn indexCol = indexColumns[i];
+            if (!col.equals(indexCol.column)) {
+                break;
+            }
+            
+            int sortType = sortTypes[i];
+            if (sortType != indexCol.sortType) {
+                break;
+            }
+            
+            coveringCount++;
+        }
+        
+        return coveringCount;
+    }
+
+    /**
+     * Determine if this index needs to read from the scan index (primary table).
+     *
+     * @param isScanIndex whether this is a scan index
+     * @param allColumnsSet the set of all columns needed by the query
+     * @return true if needs to read from scan index
+     */
+    private boolean needsToReadFromScanIndex(boolean isScanIndex, AllColumnsForPlan allColumnsSet) {
+        // If we have two indexes with the same cost, and one of the indexes can
+        // satisfy the query without needing to read from the primary table
+        // (scan index), make that one slightly lower cost.
+        if (isScanIndex || allColumnsSet == null) {
+            return true;
+        }
+        
+        ArrayList<Column> foundCols = allColumnsSet.get(getTable());
+        if (foundCols == null) {
+            return false;
+        }
+        
+        int main = table.getMainIndexColumn();
+        loop: for (Column c : foundCols) {
+            int id = c.getColumnId();
+            if (id == SearchRow.ROWID_INDEX || id == main) {
+                continue;
+            }
+            for (Column c2 : columns) {
+                if (c == c2) {
+                    continue loop;
+                }
+            }
+            return true;
+        }
+        
+        return false;
     }
 
 
