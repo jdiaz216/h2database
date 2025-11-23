@@ -20,6 +20,7 @@ import org.h2.result.Row;
 import org.h2.result.RowFactory;
 import org.h2.result.SearchRow;
 import org.h2.result.SortOrder;
+import org.h2.mode.DefaultNullOrdering;
 import org.h2.schema.SchemaObject;
 import org.h2.table.Column;
 import org.h2.table.IndexColumn;
@@ -666,65 +667,71 @@ public abstract class Index extends SchemaObject {
         if (sortOrder == null) {
             return 0;
         }
-        
         long sortingCost = 100 + rowCount / 10;
-        
+        // Only adjust sorting cost if not a scan index and we're the first filter
         if (isScanIndex) {
             return sortingCost;
         }
-        
         int coveringCount = calculateSortOrderCoveringCount(sortOrder, filters, filter);
         if (coveringCount > 0) {
-            // "coveringCount" makes sure that when we have two
-            // or more covering indexes, we choose the one
-            // that covers more.
+            // "coveringCount" ensures preference for indexes covering more ORDER BY columns.
             sortingCost = 100 - coveringCount;
         }
-        
         return sortingCost;
     }
 
     /**
-     * Calculate how many columns of the sort order are covered by this index.
+     * Calculate how many columns of the sort order are covered by this index, taking into account
+     * null ordering and potential reverse ordering.
      *
      * @param sortOrder the sort order
-     * @param filters the table filters
-     * @param filter the current filter index
+     * @param filters the table filters (must not be null and contain at least one element)
      * @return the number of covered columns, or 0 if sort order doesn't match
      */
     private int calculateSortOrderCoveringCount(SortOrder sortOrder, TableFilter[] filters, int filter) {
-        int coveringCount = 0;
+        if (filters == null || filter != 0) {
+            return 0;
+        }
         int[] sortTypes = sortOrder.getSortTypesWithNullOrdering();
-        TableFilter tableFilter = filters == null ? null : filters[filter];
-        
-        for (int i = 0, len = sortTypes.length; i < len; i++) {
-            if (i >= indexColumns.length) {
-                // We can still use this index if we are sorting by more
-                // than it's columns, it's just that the coveringCount
-                // is lower than with an index that contains
-                // more of the order by columns.
-                break;
-            }
-            
+        TableFilter tableFilter = filters[0];
+        boolean reverse = false;
+        int coveringCount = 0;
+        int max = Math.min(sortTypes.length, indexColumns.length);
+
+        for (int i = 0; i < max; i++) {
             Column col = sortOrder.getColumn(i, tableFilter);
-            if (col == null) {
+            if (col == null || !col.equals(indexColumns[i].column)) {
                 break;
             }
-            
-            IndexColumn indexCol = indexColumns[i];
-            if (!col.equals(indexCol.column)) {
-                break;
-            }
-            
+
             int sortType = sortTypes[i];
-            if (sortType != indexCol.sortType) {
-                break;
+            int indexSortType = getEffectiveIndexSortType(indexColumns[i], col);
+
+            if (i == 0) {
+                if (indexSortType == sortType) {
+                    // Match
+                } else if (indexSortType == SortOrder.inverse(sortType)) {
+                    reverse = true;
+                } else {
+                    break;
+                }
+            } else {
+                int expected = reverse ? SortOrder.inverse(sortType) : sortType;
+                if (indexSortType != expected) {
+                    break;
+                }
             }
-            
             coveringCount++;
         }
-        
         return coveringCount;
+    }
+
+    private int getEffectiveIndexSortType(IndexColumn indexColumn, Column column) {
+        int sortType = indexColumn.sortType;
+        if (column.isNullable()) {
+            return getDatabase().getDefaultNullOrdering().addExplicitNullOrdering(sortType);
+        }
+        return sortType;
     }
 
     /**
