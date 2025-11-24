@@ -193,7 +193,7 @@ public class MVSpatialIndex extends MVIndex<Spatial, Value> implements SpatialIn
     }
 
     @Override
-    public Cursor find(SessionLocal session, SearchRow first, SearchRow last) {
+    public Cursor find(SessionLocal session, SearchRow first, SearchRow last, boolean reverse) {
         Iterator<Spatial> cursor = spatialMap.keyIterator(null);
         TransactionMap<Spatial, Value> map = getMap(session);
         Iterator<Spatial> it = new SpatialKeyIterator(map, cursor, false);
@@ -201,9 +201,9 @@ public class MVSpatialIndex extends MVIndex<Spatial, Value> implements SpatialIn
     }
 
     @Override
-    public Cursor findByGeometry(SessionLocal session, SearchRow first, SearchRow last, SearchRow intersection) {
+    public Cursor findByGeometry(SessionLocal session, SearchRow first, SearchRow last, boolean reverse, SearchRow intersection) {
         if (intersection == null) {
-            return find(session, first, last);
+            return find(session, first, last, reverse);
         }
         Iterator<Spatial> cursor =
                 spatialMap.findIntersectingKeys(getKey(intersection));
