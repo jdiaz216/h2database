@@ -285,6 +285,16 @@ public final class SortOrder implements Comparator<Value[]> {
     }
 
     /**
+     * Returns the inverse sort type.
+     *
+     * @param sortTypeWithNull the sort type
+     * @return the inverse sort type
+     */
+    public static int inverse(int sortTypeWithNull) {
+        return sortTypeWithNull ^ (DESCENDING | NULLS_FIRST | NULLS_LAST);
+    }
+
+    /**
      * Returns comparator for row values.
      *
      * @return comparator for row values.

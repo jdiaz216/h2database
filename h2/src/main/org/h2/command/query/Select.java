@@ -15,6 +15,7 @@ import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map.Entry;
 
 import org.h2.api.ErrorCode;
@@ -38,6 +39,7 @@ import org.h2.expression.condition.ConditionLocalAndGlobal;
 import org.h2.expression.function.CoalesceFunction;
 import org.h2.index.Cursor;
 import org.h2.index.Index;
+import org.h2.index.IndexSort;
 import org.h2.index.QueryExpressionIndex;
 import org.h2.message.DbException;
 import org.h2.mode.DefaultNullOrdering;
@@ -149,7 +151,7 @@ public class Select extends Query {
     private ForUpdate forUpdate;
     private double cost;
     private boolean isQuickAggregateQuery, isDistinctQuery;
-    private boolean sortUsingIndex;
+    private int indexSortedColumns;
 
     private boolean isGroupWindowStage2;
 
@@ -380,35 +382,64 @@ public class Select extends Query {
     }
 
     private boolean isGroupSortedIndex(TableFilter tableFilter, Index index) {
-        // check that all the GROUP BY expressions are part of the index
         Column[] indexColumns = index.getColumns();
-        // also check that the first columns in the index are grouped
         boolean[] grouped = new boolean[indexColumns.length];
+        
+        if (!allGroupByExpressionsMatchIndex(tableFilter, indexColumns, grouped)) {
+            return false;
+        }
+        
+        return indexColumnsAreContiguous(grouped);
+    }
+    
+    /**
+     * Check that all GROUP BY expressions are part of the index.
+     * 
+     * @param tableFilter the table filter
+     * @param indexColumns the index columns
+     * @param grouped array to mark which index columns are grouped
+     * @return true if all group by expressions match index columns
+     */
+    private boolean allGroupByExpressionsMatchIndex(TableFilter tableFilter, Column[] indexColumns,
+            boolean[] grouped) {
         outerLoop:
         for (int i = 0, size = expressions.size(); i < size; i++) {
             if (!groupByExpression[i]) {
                 continue;
             }
+            
             Expression expr = expressions.get(i).getNonAliasExpression();
             if (!(expr instanceof ExpressionColumn)) {
                 return false;
             }
+            
             ExpressionColumn exprCol = (ExpressionColumn) expr;
+            if (tableFilter != exprCol.getTableFilter()) {
+                return false;
+            }
+            
             for (int j = 0; j < indexColumns.length; ++j) {
-                if (tableFilter == exprCol.getTableFilter()) {
-                    if (indexColumns[j].equals(exprCol.getColumn())) {
-                        grouped[j] = true;
-                        continue outerLoop;
-                    }
+                if (indexColumns[j].equals(exprCol.getColumn())) {
+                    grouped[j] = true;
+                    continue outerLoop;
                 }
             }
-            // We didn't find a matching index column
-            // for one group by expression
+            
+            // We didn't find a matching index column for one group by expression
             return false;
         }
-        // check that the first columns in the index are grouped
-        // good: index(a, b, c); group by b, a
-        // bad: index(a, b, c); group by a, c
+        return true;
+    }
+    
+    /**
+     * Check that grouped index columns are contiguous from the start.
+     * Good: index(a, b, c); group by b, a
+     * Bad: index(a, b, c); group by a, c
+     * 
+     * @param grouped array marking which index columns are grouped
+     * @return true if grouped columns are contiguous
+     */
+    private boolean indexColumnsAreContiguous(boolean[] grouped) {
         for (int i = 1; i < grouped.length; i++) {
             if (!grouped[i - 1] && grouped[i]) {
                 return false;
@@ -582,14 +613,11 @@ public class Select extends Query {
     }
 
     /**
-     * Get the index that matches the ORDER BY list, if one exists. This is to
-     * avoid running a separate ORDER BY if an index can be used. This is
-     * specially important for large result sets, if only the first few rows are
-     * important (LIMIT is used)
+     * Returns possible index-sorting operations (better first) if they exist.
      *
-     * @return the index if one is found
+     * @return possible index-sorting operations, or {@code null} if unavailable
      */
-    private Index getSortIndex() {
+    private List<IndexSort> getIndexSorts() {
         if (sort == null) {
             return null;
         }
@@ -597,73 +625,115 @@ public class Select extends Query {
         int[] queryColumnIndexes = sort.getQueryColumnIndexes();
         int queryIndexesLength = queryColumnIndexes.length;
         int[] sortIndex = new int[queryIndexesLength];
-        for (int i = 0, j = 0; i < queryIndexesLength; i++) {
+        int sortedColumns = 0;
+        boolean needMore = false;
+        for (int i = 0; i < queryIndexesLength; i++) {
             int idx = queryColumnIndexes[i];
             if (idx < 0 || idx >= expressions.size()) {
                 throw DbException.getInvalidValueException("ORDER BY", idx + 1);
             }
-            Expression expr = expressions.get(idx);
-            expr = expr.getNonAliasExpression();
+            Expression expr = expressions.get(idx).getNonAliasExpression();
             if (expr.isConstant()) {
                 continue;
             }
             if (!(expr instanceof ExpressionColumn)) {
-                return null;
+                needMore = true;
+                break;
             }
             ExpressionColumn exprCol = (ExpressionColumn) expr;
             if (exprCol.getTableFilter() != topTableFilter) {
-                return null;
+                needMore = true;
+                break;
             }
             sortColumns.add(exprCol.getColumn());
-            sortIndex[j++] = i;
+            sortIndex[sortedColumns++] = i;
         }
-        Column[] sortCols = sortColumns.toArray(new Column[0]);
-        if (sortCols.length == 0) {
+        if (sortedColumns == 0) {
+            if (needMore) {
+                // Can't sort using index
+                return null;
+            }
             // sort just on constants - can use scan index
-            return topTableFilter.getTable().getScanIndex(session);
+            return List.of(new IndexSort(topTableFilter.getTable().getScanIndex(session), false));
+        }
+        Column[] sortCols;
+        int[] sortTypes = sort.getSortTypesWithNullOrdering();
+        if (sortedColumns == 1) {
+            Column column = sortColumns.get(0);
+            if (column.getColumnId() == -1) {
+                // special case: order by _ROWID_
+                Index index = topTableFilter.getTable().getScanIndex(session);
+                if (index.isRowIdIndex()) {
+                    return List.of(new IndexSort(index, needMore ? sortedColumns : IndexSort.FULLY_SORTED,
+                            (sortTypes[sortIndex[0]] & SortOrder.DESCENDING) != 0));
+                }
+            }
+            sortCols = new Column[] { column };
+        } else {
+            sortCols = sortColumns.toArray(new Column[0]);
         }
         ArrayList<Index> list = topTableFilter.getTable().getIndexes();
-        if (list != null) {
-            int[] sortTypes = sort.getSortTypesWithNullOrdering();
-            DefaultNullOrdering defaultNullOrdering = getDatabase().getDefaultNullOrdering();
-            loop: for (Index index : list) {
-                if (index.getCreateSQL() == null) {
-                    // can't use the scan index
-                    continue;
-                }
-                if (index.getIndexType().isHash()) {
-                    continue;
-                }
-                IndexColumn[] indexCols = index.getIndexColumns();
-                if (indexCols.length < sortCols.length) {
-                    continue;
-                }
-                for (int j = 0; j < sortCols.length; j++) {
-                    // the index and the sort order must start
-                    // with the exact same columns
-                    IndexColumn idxCol = indexCols[j];
-                    Column sortCol = sortCols[j];
-                    if (idxCol.column != sortCol) {
-                        continue loop;
-                    }
-                    int sortType = sortTypes[sortIndex[j]];
-                    if (sortCol.isNullable()
-                            ? defaultNullOrdering.addExplicitNullOrdering(idxCol.sortType) != sortType
-                            : (idxCol.sortType & SortOrder.DESCENDING) != (sortType & SortOrder.DESCENDING)) {
-                        continue loop;
-                    }
-                }
-                return index;
-            }
+        if (list == null) {
+            return null;
         }
-        if (sortCols.length == 1 && sortCols[0].getColumnId() == -1) {
-            // special case: order by _ROWID_
-            Index index = topTableFilter.getTable().getScanIndex(session);
-            if (index.isRowIdIndex()) {
-                return index;
+        DefaultNullOrdering defaultNullOrdering = getDatabase().getDefaultNullOrdering();
+        ArrayList<IndexSort> indexSorts = Utils.newSmallArrayList();
+        loop: for (Index index : list) {
+            if (index.getCreateSQL() == null || index.getIndexType().isHash()) {
+                // can't use scan or hash indexes
+                continue;
             }
+            IndexColumn[] indexCols = index.getIndexColumns();
+            int count = Math.min(indexCols.length, sortedColumns);
+            boolean reverse = false;
+            for (int j = 0; j < count; j++) {
+                // the index and the sort order must start
+                // with the exact same columns
+                IndexColumn idxCol = indexCols[j];
+                Column sortCol = sortCols[j];
+                boolean mismatch = idxCol.column != sortCol;
+                if (!mismatch) {
+                    if (sortCol.isNullable()) {
+                        int o1 = defaultNullOrdering.addExplicitNullOrdering(idxCol.sortType);
+                        int o2 = sortTypes[sortIndex[j]];
+                        if (j == 0) {
+                            if (o1 != o2) {
+                                if (o1 == SortOrder.inverse(o2)) {
+                                    reverse = true;
+                                } else {
+                                    mismatch = true;
+                                }
+                            }
+                        } else {
+                            if (o1 != (reverse ? SortOrder.inverse(o2) : o2)) {
+                                mismatch = true;
+                            }
+                        }
+                    } else {
+                        boolean different = (idxCol.sortType & SortOrder.DESCENDING) //
+                                != (sortTypes[sortIndex[j]] & SortOrder.DESCENDING);
+                        if (j == 0) {
+                            reverse = different;
+                        } else {
+                            mismatch = different != reverse;
+                        }
+                    }
+                }
+                if (mismatch) {
+                    if (j > 0) {
+                        indexSorts.add(new IndexSort(index, j, reverse));
+                    }
+                    continue loop;
+                }
+            }
+            indexSorts.add(new IndexSort(index, needMore || count < sortedColumns ? count : IndexSort.FULLY_SORTED,
+                    reverse));
         }
-        return null;
+        if (indexSorts.isEmpty()) {
+            return null;
+        }
+        indexSorts.sort(null);
+        return indexSorts;
     }
 
     private void queryDistinct(ResultTarget result, long offset, long limitRows, boolean withTies,
@@ -700,7 +770,7 @@ public class Select extends Query {
                 continue;
             }
             result.addRow(value);
-            if ((sort == null || sortUsingIndex) && limitRows > 0 && rowNumber >= limitRows && !withTies) {
+            if ((sort == null || indexSortedColumns >= IndexSort.FULLY_SORTED) && limitRows > 0 && rowNumber >= limitRows && !withTies) {
                 break;
             }
         }
@@ -720,7 +790,7 @@ public class Select extends Query {
         if (result == null) {
             return lazyResult;
         }
-        if (limitRows < 0 || sort != null && !sortUsingIndex || withTies && !quickOffset) {
+        if (limitRows < 0 || sort != null && indexSortedColumns < IndexSort.FULLY_SORTED || withTies && !quickOffset) {
             limitRows = Long.MAX_VALUE;
         }
         Value[] row = null;
@@ -779,10 +849,10 @@ public class Select extends Query {
         }
         // Do not add rows before OFFSET to result if possible
         boolean quickOffset = !fetchPercent;
-        if (sort != null && (!sortUsingIndex || isAnyDistinct())) {
+        if (sort != null && (indexSortedColumns < IndexSort.FULLY_SORTED || isAnyDistinct())) {
             result = createLocalResult(result);
             result.setSortOrder(sort);
-            if (!sortUsingIndex) {
+            if (indexSortedColumns < IndexSort.FULLY_SORTED) {
                 quickOffset = false;
             }
         }
@@ -1215,46 +1285,50 @@ public class Select extends Query {
                     Index current = topTableFilter.getIndex();
                     // if another index is faster
                     if (current == null || current.getIndexType().isScan() || columnIndex == current) {
-                        topTableFilter.setIndex(columnIndex);
+                        topTableFilter.setIndex(columnIndex, false);
                         isDistinctQuery = true;
                     }
                 }
             }
         }
         if (sort != null && !isQuickAggregateQuery && !isGroupQuery) {
-            Index index = getSortIndex();
-            Index current = topTableFilter.getIndex();
-            if (index != null && current != null) {
-                if (current.getIndexType().isScan() || current == index) {
-                    topTableFilter.setIndex(index);
-                    if (!topTableFilter.hasInComparisons()) {
-                        // in(select ...) and in(1,2,3) may return the key in
-                        // another order
-                        sortUsingIndex = true;
-                    }
-                } else if (index.getIndexColumns() != null
-                        && index.getIndexColumns().length >= current
-                                .getIndexColumns().length) {
-                    IndexColumn[] sortColumns = index.getIndexColumns();
-                    IndexColumn[] currentColumns = current.getIndexColumns();
-                    boolean swapIndex = false;
-                    for (int i = 0; i < currentColumns.length; i++) {
-                        if (sortColumns[i].column != currentColumns[i].column) {
-                            swapIndex = false;
-                            break;
+            List<IndexSort> indexSorts = getIndexSorts();
+            if (indexSorts != null) {
+                IndexSort indexSort = indexSorts.get(0);
+                Index index = indexSort.getIndex();
+                Index current = topTableFilter.getIndex();
+                if (current != null) {
+                    if (current.getIndexType().isScan() || current == index) {
+                        topTableFilter.setIndex(index, indexSort.isReverse());
+                        if (!topTableFilter.hasInComparisons()) {
+                            // in(select ...) and in(1,2,3) may return the key in
+                            // another order
+                            indexSortedColumns = indexSort.getSortedColumns();
                         }
-                        if (sortColumns[i].sortType != currentColumns[i].sortType) {
-                            swapIndex = true;
+                    } else if (index.getIndexColumns() != null
+                            && index.getIndexColumns().length >= current
+                                    .getIndexColumns().length) {
+                        IndexColumn[] sortColumns = index.getIndexColumns();
+                        IndexColumn[] currentColumns = current.getIndexColumns();
+                        boolean swapIndex = false;
+                        for (int i = 0; i < currentColumns.length; i++) {
+                            if (sortColumns[i].column != currentColumns[i].column) {
+                                swapIndex = false;
+                                break;
+                            }
+                            if (sortColumns[i].sortType != currentColumns[i].sortType) {
+                                swapIndex = true;
+                            }
                         }
-                    }
-                    if (swapIndex) {
-                        topTableFilter.setIndex(index);
-                        sortUsingIndex = true;
+                        if (swapIndex) {
+                            topTableFilter.setIndex(index, indexSort.isReverse());
+                            indexSortedColumns = indexSort.getSortedColumns();
+                        }
                     }
                 }
             }
-            if (sortUsingIndex && forUpdate != null && !topTableFilter.getIndex().isRowIdIndex()) {
-                sortUsingIndex = false;
+            if (indexSortedColumns > 0 && forUpdate != null && !topTableFilter.getIndex().isRowIdIndex()) {
+                indexSortedColumns = 0;
             }
         }
         if (!isQuickAggregateQuery && isGroupQuery) {
@@ -1262,7 +1336,7 @@ public class Select extends Query {
             if (index != null) {
                 Index current = topTableFilter.getIndex();
                 if (current != null && (current.getIndexType().isScan() || current == index)) {
-                    topTableFilter.setIndex(index);
+                    topTableFilter.setIndex(index, false);
                     isGroupSortedQuery = true;
                 }
             }
@@ -1448,8 +1522,11 @@ public class Select extends Query {
             if (isDistinctQuery) {
                 builder.append("\n/* distinct */");
             }
-            if (sortUsingIndex) {
+            if (indexSortedColumns == IndexSort.FULLY_SORTED) {
                 builder.append("\n/* index sorted */");
+            } else if (indexSortedColumns > 0) {
+                builder.append("\n/* index sorted: ").append(indexSortedColumns).append(" of ") //
+                        .append(sort.getOrderList().size()).append(" columns */");
             }
             if (isGroupQuery) {
                 if (isGroupSortedQuery) {
