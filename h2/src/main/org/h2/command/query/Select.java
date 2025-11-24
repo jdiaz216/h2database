@@ -380,35 +380,64 @@ public class Select extends Query {
     }
 
     private boolean isGroupSortedIndex(TableFilter tableFilter, Index index) {
-        // check that all the GROUP BY expressions are part of the index
         Column[] indexColumns = index.getColumns();
-        // also check that the first columns in the index are grouped
         boolean[] grouped = new boolean[indexColumns.length];
+        
+        if (!allGroupByExpressionsMatchIndex(tableFilter, indexColumns, grouped)) {
+            return false;
+        }
+        
+        return indexColumnsAreContiguous(grouped);
+    }
+    
+    /**
+     * Check that all GROUP BY expressions are part of the index.
+     * 
+     * @param tableFilter the table filter
+     * @param indexColumns the index columns
+     * @param grouped array to mark which index columns are grouped
+     * @return true if all group by expressions match index columns
+     */
+    private boolean allGroupByExpressionsMatchIndex(TableFilter tableFilter, Column[] indexColumns,
+            boolean[] grouped) {
         outerLoop:
         for (int i = 0, size = expressions.size(); i < size; i++) {
             if (!groupByExpression[i]) {
                 continue;
             }
+            
             Expression expr = expressions.get(i).getNonAliasExpression();
             if (!(expr instanceof ExpressionColumn)) {
                 return false;
             }
+            
             ExpressionColumn exprCol = (ExpressionColumn) expr;
+            if (tableFilter != exprCol.getTableFilter()) {
+                return false;
+            }
+            
             for (int j = 0; j < indexColumns.length; ++j) {
-                if (tableFilter == exprCol.getTableFilter()) {
-                    if (indexColumns[j].equals(exprCol.getColumn())) {
-                        grouped[j] = true;
-                        continue outerLoop;
-                    }
+                if (indexColumns[j].equals(exprCol.getColumn())) {
+                    grouped[j] = true;
+                    continue outerLoop;
                 }
             }
-            // We didn't find a matching index column
-            // for one group by expression
+            
+            // We didn't find a matching index column for one group by expression
             return false;
         }
-        // check that the first columns in the index are grouped
-        // good: index(a, b, c); group by b, a
-        // bad: index(a, b, c); group by a, c
+        return true;
+    }
+    
+    /**
+     * Check that grouped index columns are contiguous from the start.
+     * Good: index(a, b, c); group by b, a
+     * Bad: index(a, b, c); group by a, c
+     * 
+     * @param grouped array marking which index columns are grouped
+     * @return true if grouped columns are contiguous
+     */
+    private boolean indexColumnsAreContiguous(boolean[] grouped) {
         for (int i = 1; i < grouped.length; i++) {
             if (!grouped[i - 1] && grouped[i]) {
                 return false;
@@ -593,77 +622,201 @@ public class Select extends Query {
         if (sort == null) {
             return null;
         }
+        
+        SortIndexContext sortContext = extractSortColumns();
+        if (sortContext == null) {
+            return null;
+        }
+        
+        if (sortContext.sortColumns.length == 0) {
+            // sort just on constants - can use scan index
+            return topTableFilter.getTable().getScanIndex(session);
+        }
+        
+        Index matchingIndex = findMatchingIndex(sortContext);
+        if (matchingIndex != null) {
+            return matchingIndex;
+        }
+        
+        return checkForRowIdIndex(sortContext.sortColumns);
+    }
+    
+    /**
+     * Extract sort columns from the ORDER BY clause and validate them.
+     * 
+     * @return SortIndexContext containing sort columns and mapping, or null if invalid
+     */
+    private SortIndexContext extractSortColumns() {
         ArrayList<Column> sortColumns = Utils.newSmallArrayList();
         int[] queryColumnIndexes = sort.getQueryColumnIndexes();
         int queryIndexesLength = queryColumnIndexes.length;
         int[] sortIndex = new int[queryIndexesLength];
+        
         for (int i = 0, j = 0; i < queryIndexesLength; i++) {
             int idx = queryColumnIndexes[i];
             if (idx < 0 || idx >= expressions.size()) {
                 throw DbException.getInvalidValueException("ORDER BY", idx + 1);
             }
-            Expression expr = expressions.get(idx);
-            expr = expr.getNonAliasExpression();
+            
+            Expression expr = expressions.get(idx).getNonAliasExpression();
             if (expr.isConstant()) {
                 continue;
             }
-            if (!(expr instanceof ExpressionColumn)) {
+            
+            if (!isValidSortExpression(expr)) {
                 return null;
             }
+            
             ExpressionColumn exprCol = (ExpressionColumn) expr;
-            if (exprCol.getTableFilter() != topTableFilter) {
-                return null;
-            }
             sortColumns.add(exprCol.getColumn());
             sortIndex[j++] = i;
         }
-        Column[] sortCols = sortColumns.toArray(new Column[0]);
-        if (sortCols.length == 0) {
-            // sort just on constants - can use scan index
-            return topTableFilter.getTable().getScanIndex(session);
+        
+        return new SortIndexContext(sortColumns.toArray(new Column[0]), sortIndex);
+    }
+    
+    /**
+     * Check if an expression is valid for index-based sorting.
+     * 
+     * @param expr the expression to check
+     * @return true if the expression can use an index for sorting
+     */
+    private boolean isValidSortExpression(Expression expr) {
+        if (!(expr instanceof ExpressionColumn)) {
+            return false;
         }
+        ExpressionColumn exprCol = (ExpressionColumn) expr;
+        return exprCol.getTableFilter() == topTableFilter;
+    }
+    
+    /**
+     * Find an index that matches the sort requirements.
+     * 
+     * @param sortContext the sort context with columns and types
+     * @return matching index or null
+     */
+    private Index findMatchingIndex(SortIndexContext sortContext) {
         ArrayList<Index> list = topTableFilter.getTable().getIndexes();
-        if (list != null) {
-            int[] sortTypes = sort.getSortTypesWithNullOrdering();
-            DefaultNullOrdering defaultNullOrdering = getDatabase().getDefaultNullOrdering();
-            loop: for (Index index : list) {
-                if (index.getCreateSQL() == null) {
-                    // can't use the scan index
-                    continue;
-                }
-                if (index.getIndexType().isHash()) {
-                    continue;
-                }
-                IndexColumn[] indexCols = index.getIndexColumns();
-                if (indexCols.length < sortCols.length) {
-                    continue;
-                }
-                for (int j = 0; j < sortCols.length; j++) {
-                    // the index and the sort order must start
-                    // with the exact same columns
-                    IndexColumn idxCol = indexCols[j];
-                    Column sortCol = sortCols[j];
-                    if (idxCol.column != sortCol) {
-                        continue loop;
-                    }
-                    int sortType = sortTypes[sortIndex[j]];
-                    if (sortCol.isNullable()
-                            ? defaultNullOrdering.addExplicitNullOrdering(idxCol.sortType) != sortType
-                            : (idxCol.sortType & SortOrder.DESCENDING) != (sortType & SortOrder.DESCENDING)) {
-                        continue loop;
-                    }
-                }
+        if (list == null) {
+            return null;
+        }
+        
+        int[] sortTypes = sort.getSortTypesWithNullOrdering();
+        DefaultNullOrdering defaultNullOrdering = getDatabase().getDefaultNullOrdering();
+        
+        for (Index index : list) {
+            if (isIndexUsableForSorting(index, sortContext, sortTypes, defaultNullOrdering)) {
                 return index;
             }
         }
+        return null;
+    }
+    
+    /**
+     * Check if an index can be used for sorting based on the sort requirements.
+     * 
+     * @param index the index to check
+     * @param sortContext the sort context
+     * @param sortTypes the requested sort types
+     * @param defaultNullOrdering the default null ordering
+     * @return true if the index can be used
+     */
+    private boolean isIndexUsableForSorting(Index index, SortIndexContext sortContext,
+            int[] sortTypes, DefaultNullOrdering defaultNullOrdering) {
+        if (index.getCreateSQL() == null || index.getIndexType().isHash()) {
+            return false;
+        }
+        
+        IndexColumn[] indexCols = index.getIndexColumns();
+        if (indexCols.length < sortContext.sortColumns.length) {
+            return false;
+        }
+        
+        return indexColumnsMatchSortOrder(indexCols, sortContext, sortTypes, defaultNullOrdering);
+    }
+    
+    /**
+     * Check if index columns match the required sort order.
+     * 
+     * @param indexCols the index columns
+     * @param sortContext the sort context
+     * @param sortTypes the requested sort types
+     * @param defaultNullOrdering the default null ordering
+     * @return true if columns match
+     */
+    private boolean indexColumnsMatchSortOrder(IndexColumn[] indexCols, SortIndexContext sortContext,
+            int[] sortTypes, DefaultNullOrdering defaultNullOrdering) {
+        for (int j = 0; j < sortContext.sortColumns.length; j++) {
+            IndexColumn idxCol = indexCols[j];
+            Column sortCol = sortContext.sortColumns[j];
+            
+            if (idxCol.column != sortCol) {
+                return false;
+            }
+            
+            if (!sortTypesMatch(idxCol, sortCol, sortTypes[sortContext.sortIndex[j]], defaultNullOrdering)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    /**
+     * Check if the sort types match between index column and requested sort.
+     * 
+     * @param idxCol the index column
+     * @param sortCol the sort column
+     * @param sortType the requested sort type
+     * @param defaultNullOrdering the default null ordering
+     * @return true if sort types match
+     */
+    private boolean sortTypesMatch(IndexColumn idxCol, Column sortCol, int sortType,
+            DefaultNullOrdering defaultNullOrdering) {
+        if (sortCol.isNullable()) {
+            return defaultNullOrdering.addExplicitNullOrdering(idxCol.sortType) == sortType;
+        } else {
+            return hasSameDescendingOrder(idxCol.sortType, sortType);
+        }
+    }
+    
+    /**
+     * Check if two sort types have the same ascending/descending order.
+     * 
+     * @param indexSortType the index sort type
+     * @param requestedSortType the requested sort type
+     * @return true if both have same descending flag
+     */
+    private boolean hasSameDescendingOrder(int indexSortType, int requestedSortType) {
+        return (indexSortType & SortOrder.DESCENDING) == (requestedSortType & SortOrder.DESCENDING);
+    }
+    
+    /**
+     * Check for special case: order by _ROWID_
+     * 
+     * @param sortCols the sort columns
+     * @return the row ID index if applicable, null otherwise
+     */
+    private Index checkForRowIdIndex(Column[] sortCols) {
         if (sortCols.length == 1 && sortCols[0].getColumnId() == -1) {
-            // special case: order by _ROWID_
             Index index = topTableFilter.getTable().getScanIndex(session);
             if (index.isRowIdIndex()) {
                 return index;
             }
         }
         return null;
+    }
+    
+    /**
+     * Helper class to hold sort index context.
+     */
+    private static class SortIndexContext {
+        final Column[] sortColumns;
+        final int[] sortIndex;
+        
+        SortIndexContext(Column[] sortColumns, int[] sortIndex) {
+            this.sortColumns = sortColumns;
+            this.sortIndex = sortIndex;
+        }
     }
 
     private void queryDistinct(ResultTarget result, long offset, long limitRows, boolean withTies,
